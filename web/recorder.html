@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recorder</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 16px system-ui, sans-serif;
+      background: #0b1020;
+      color: #e8edff;
+    }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; }
+    html.capture-error,
+    html.capture-error body { background: #b00020; }
+    .card {
+      width: min(440px, calc(100% - 40px));
+      padding: 28px;
+      background: #151c31;
+      border: 1px solid #2c3655;
+      border-radius: 18px;
+      box-shadow: 0 20px 60px #0008;
+    }
+    html.capture-error .card {
+      background: #520b15;
+      border-color: #ff5368;
+      box-shadow: 0 20px 70px #180004;
+    }
+    label { display: block; margin: 15px 0 6px; font-weight: 650; }
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 11px 12px;
+      color: white;
+      background: #0d1428;
+      border: 1px solid #3a466b;
+      border-radius: 9px;
+      font: inherit;
+    }
+    button {
+      width: 100%;
+      margin-top: 20px;
+      padding: 12px;
+      color: white;
+      background: #6d7cff;
+      border: 0;
+      border-radius: 9px;
+      font: 700 1rem inherit;
+      cursor: pointer;
+    }
+    button.secondary { background: #303b5d; }
+    html.capture-error input,
+    html.capture-error .status { background: #290006; border-color: #a92c3d; }
+    html.capture-error button { background: #d71936; }
+    html.capture-error button.secondary { background: #89152a; }
+    #stop { display: none; }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-top: 20px;
+      padding: 12px;
+      background: #0d1428;
+      border-radius: 9px;
+    }
+    .dot { width: 11px; height: 11px; background: #8390b4; border-radius: 50%; }
+    .dot.live { background: #42dc8b; box-shadow: 0 0 12px #42dc8b; }
+    .dot.warn { background: #ffb454; }
+    dialog {
+      width: min(480px, calc(100% - 48px));
+      padding: 26px;
+      color: #fff;
+      background: #6b0c19;
+      border: 2px solid #ff7183;
+      border-radius: 14px;
+      box-shadow: 0 24px 90px #160003;
+    }
+    dialog::backdrop { background: #b00020e6; }
+    dialog h2 { margin: 0 0 12px; font-size: 1.55rem; }
+    dialog p { margin: 0; font-size: 1.05rem; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <form id="login">
+      <label for="username">Username</label>
+      <input id="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Start recording</button>
+    </form>
+    <button id="stop" class="secondary">Stop recording</button>
+    <div class="status">
+      <span id="dot" class="dot"></span>
+      <span id="status">Ready</span>
+    </div>
+  </main>
+  <dialog id="capture-alert" role="alertdialog" aria-modal="true"
+          aria-labelledby="capture-alert-title" aria-describedby="capture-alert-message">
+    <h2 id="capture-alert-title">Entire screen required</h2>
+    <p id="capture-alert-message">A window or tab was selected. Click below and choose an entire screen.</p>
+    <button id="capture-alert-retry" type="button" autofocus>Choose entire screen again</button>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>

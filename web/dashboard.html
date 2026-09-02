@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recorder dashboard</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #0a0f1c; color: #eef2ff; }
+    body { margin: 0; padding: 32px; }
+    .wrap { max-width: 1100px; margin: auto; }
+    header { display: flex; justify-content: space-between; align-items: end; padding-bottom: 18px; border-bottom: 1px solid #28334e; }
+    h1, h2 { margin: 0; }
+    .connection { color: #94a1c4; }
+    .offline { margin: 26px 0; padding: 20px; background: #321c24; border: 1px solid #6e3042; border-radius: 14px; }
+    .offline h2 { color: #ff8ea7; }
+    .names { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .pill { padding: 8px 12px; background: #5d2636; border-radius: 999px; font-weight: 750; }
+    .online { padding: 14px; background: #11192b; border: 1px solid #28334e; border-radius: 14px; }
+    .count { color: #83e6ae; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 7px; margin-top: 10px; }
+    .client { padding: 7px 10px; background: #182238; border-left: 3px solid #43d68a; border-radius: 6px; }
+    .user { font-size: .95rem; font-weight: 700; overflow-wrap: anywhere; }
+    .empty { margin-top: 14px; color: #8390ad; }
+    @media (max-width: 600px) { body { padding: 18px; } header { align-items: start; flex-direction: column; gap: 8px; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <div><h1>Recorder dashboard</h1><div class="connection" id="updated">Connecting…</div></div>
+      <strong id="summary"></strong>
+    </header>
+    <section class="offline"><h2>Not connected</h2><div id="offline" class="names"></div></section>
+    <section class="online"><h2>Connected <span id="count" class="count"></span></h2><div id="connected" class="grid"></div></section>
+  </main>
+  <script>
+    const LOG_PREFIX = '[scrrec dashboard]';
+    const offlineElement = document.querySelector('#offline');
+    const connectedElement = document.querySelector('#connected');
+    const updatedElement = document.querySelector('#updated');
+    const countElement = document.querySelector('#count');
+    const summaryElement = document.querySelector('#summary');
+    const knownUsers = new Set();
+
+    function escapeHTML(value) {
+      return String(value).replace(/[&<>"']/g, (character) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[character]);
+    }
+
+    function compareNames(left, right) {
+      return left.localeCompare(right, undefined, { sensitivity: 'base', numeric: true });
+    }
+
+    function render(state) {
+      const offlineNames = [...state.offline].sort(compareNames);
+      const connectedClients = [...state.connected].sort((left, right) =>
+        compareNames(left.username, right.username) || new Date(left.connected) - new Date(right.connected));
+      offlineNames.forEach((name) => knownUsers.add(name));
+      connectedClients.forEach((client) => knownUsers.add(client.username));
+      offlineElement.innerHTML = offlineNames.length
+        ? offlineNames.map((name) => `<span class="pill">${escapeHTML(name)}</span>`).join('')
+        : '<span class="empty">Everyone is connected.</span>';
+      countElement.textContent = `(${connectedClients.length})`;
+      connectedElement.innerHTML = connectedClients.length
+        ? connectedClients.map((client) => `
+            <article class="client">
+              <div class="user">${escapeHTML(client.username)} - ${escapeHTML(client.remote)}</div>
+            </article>`).join('')
+        : '<div class="empty">No active recorders.</div>';
+      summaryElement.textContent = `${offlineNames.length} offline`;
+      updatedElement.textContent = `Live · updated ${new Date().toLocaleTimeString()}`;
+      console.info(LOG_PREFIX, 'State updated', { offline: offlineNames.length, connected: connectedClients.length });
+    }
+
+    function markDisconnected() {
+      render({ offline: [...knownUsers], connected: [] });
+      updatedElement.textContent = 'Reconnecting dashboard… · all users considered offline';
+      console.warn(LOG_PREFIX, 'Event stream disconnected; all users marked offline');
+    }
+
+    const events = new EventSource('/events');
+    events.addEventListener('state', (event) => {
+      try {
+        render(JSON.parse(event.data));
+      } catch (error) {
+        console.error(LOG_PREFIX, 'Invalid dashboard state', error, event.data);
+      }
+    });
+    events.onerror = markDisconnected;
+    events.onopen = () => {
+      updatedElement.textContent = 'Connected; waiting for server state…';
+      console.info(LOG_PREFIX, 'Event stream connected');
+    };
+  </script>
+</body>
+</html>
