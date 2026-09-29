@@ -79,6 +79,17 @@
     dialog::backdrop { background: #b00020e6; }
     dialog h2 { margin: 0 0 12px; font-size: 1.55rem; }
     dialog p { margin: 0; font-size: 1.05rem; line-height: 1.5; }
+    /* Frame source for the encoder. It stays rendered and inside the viewport
+       because display:none or offscreen media may stop updating. */
+    #capture-video {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -102,6 +113,7 @@
     <p id="capture-alert-message">A window or tab was selected. Click below and choose an entire screen.</p>
     <button id="capture-alert-retry" type="button" autofocus>Choose entire screen again</button>
   </dialog>
+  <video id="capture-video" muted playsinline aria-hidden="true"></video>
   <script src="/app.js"></script>
 </body>
 </html>

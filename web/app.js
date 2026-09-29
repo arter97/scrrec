@@ -3,8 +3,10 @@
 const FPS = __FPS__;
 const BITRATE = __BITRATE__;
 const KEYFRAME_INTERVAL_SECONDS = 10;
+const FRAME_DURATION_MICROSECONDS = Math.round(1e6 / FPS);
 const LOG_PREFIX = '[scrrec]';
 
+const captureVideo = document.querySelector('#capture-video');
 const login = document.querySelector('#login');
 const stopButton = document.querySelector('#stop');
 const statusElement = document.querySelector('#status');
@@ -117,6 +119,24 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+// Browsers throttle main-thread timers on hidden pages to once per second or
+// less, and the recorder tab is usually hidden while the screen is shared.
+// Dedicated-worker timers are not throttled, so the frame clock runs there.
+const frameClockURL = URL.createObjectURL(new Blob([`
+  let timer = null;
+  self.onmessage = ({ data }) => {
+    clearInterval(timer);
+    timer = setInterval(() => self.postMessage(null), data);
+  };
+`], { type: 'text/javascript' }));
+
+function startFrameClock(intervalMilliseconds, onTick) {
+  const worker = new Worker(frameClockURL);
+  worker.onmessage = onTick;
+  worker.postMessage(intervalMilliseconds);
+  return { stop: () => worker.terminate() };
+}
+
 function roundToMultiple(value, multiple) {
   return Math.max(multiple, Math.round(value / multiple) * multiple);
 }
@@ -179,6 +199,7 @@ async function stopEverything(message) {
   if (websocket === activeSocket) websocket = null;
   captureStream?.getTracks().forEach((track) => track.stop());
   captureStream = null;
+  captureVideo.srcObject = null;
   selectedCodec = null;
   starting = false;
   login.style.display = 'block';
@@ -306,6 +327,7 @@ async function prepareCapture() {
 
   try {
     selectedCodec = await chooseCodec(candidate);
+    await attachCaptureVideo(candidate);
   } catch (error) {
     candidate.getTracks().forEach((candidateTrack) => candidateTrack.stop());
     throw error;
@@ -317,6 +339,18 @@ async function prepareCapture() {
       stopEverything('Screen sharing ended');
     }
   }, { once: true });
+}
+
+// Frames are read from a playing <video> element rather than a
+// MediaStreamTrackProcessor, which Safari and Firefox do not expose on window.
+async function attachCaptureVideo(stream) {
+  captureVideo.srcObject = stream;
+  await captureVideo.play();
+  log('Capture video playing', {
+    videoWidth: captureVideo.videoWidth,
+    videoHeight: captureVideo.videoHeight,
+    readyState: captureVideo.readyState,
+  });
 }
 
 async function requestCaptureResize(track, sourceSettings) {
@@ -592,21 +626,24 @@ async function startEncoder(socket, filename) {
     filename,
     codecChoice: selectedCodec,
     encoder: null,
-    reader: null,
+    clock: null,
     stopped: false,
-    needsKeyFrame: true,
+    startedAt: performance.now(),
+    lastKeyFrameTimestamp: null,
     framesSubmitted: 0,
+    framesDropped: 0,
+    waitingLogged: false,
     chunksSent: 0,
     bytesSent: 0,
     resizeCanvas: null,
     resizeContext: null,
     resizeLogged: false,
-    done: null,
   };
   session.encoder = new VideoEncoder({
     output: (chunk, metadata) => handleEncodedChunk(session, chunk, metadata),
     error: (error) => {
       if (!session.stopped) {
+        session.clock?.stop();
         logError('VideoEncoder reported an error', error);
         if (session.chunksSent === 0 && advanceEncoderChoice(session.codecChoice, error)) {
         setStatus('Encoder backend failed; retrying another configuration…', 'warn');
@@ -621,17 +658,9 @@ async function startEncoder(socket, filename) {
   log('Configuring VideoEncoder', session.codecChoice.config);
   session.encoder.configure(session.codecChoice.config);
 
-  const track = captureStream.getVideoTracks()[0];
-  let processor;
-  try {
-    processor = new MediaStreamTrackProcessor({ track });
-  } catch (objectFormError) {
-    logWarning('TrackProcessor object constructor failed; trying legacy form', objectFormError);
-    processor = new MediaStreamTrackProcessor(track);
-  }
-  session.reader = processor.readable.getReader();
   encoderSession = session;
-  session.done = pumpFrames(session);
+  session.clock = startFrameClock(1000 / FPS, () => encodeCurrentFrame(session));
+  encodeCurrentFrame(session);
   starting = false;
   setStatus('Recording', 'live');
   startRecordingTimer();
@@ -667,72 +696,73 @@ function handleEncodedChunk(session, chunk, metadata) {
   }
 }
 
-async function pumpFrames(session) {
+function encodeCurrentFrame(session) {
+  if (session.stopped) return;
+  if (captureVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      !captureVideo.videoWidth || !captureVideo.videoHeight) {
+    if (!session.waitingLogged) {
+      session.waitingLogged = true;
+      logWarning('Capture video has no frame yet; skipping tick', {
+        readyState: captureVideo.readyState,
+      });
+    }
+    return;
+  }
+  if (session.encoder.encodeQueueSize > 2) {
+    session.framesDropped += 1;
+    if (session.framesDropped === 1 || session.framesDropped % 10 === 0) {
+      logWarning('Encoder queue is backed up; dropping frame', {
+        queueSize: session.encoder.encodeQueueSize,
+        framesSubmitted: session.framesSubmitted,
+        framesDropped: session.framesDropped,
+      });
+    }
+    return;
+  }
+
+  const timestamp = Math.round((performance.now() - session.startedAt) * 1000);
+  let frame = null;
   try {
-    while (!session.stopped) {
-      const result = await session.reader.read();
-      if (result.done) {
-        log('Capture frame stream ended', { filename: session.filename });
-        break;
-      }
-      const sourceFrame = result.value;
-      let encoderFrame = sourceFrame;
-      try {
-        while (!session.stopped && session.encoder.encodeQueueSize > 2) {
-          logWarning('Encoder queue is backed up', {
-            queueSize: session.encoder.encodeQueueSize,
-            framesSubmitted: session.framesSubmitted,
-          });
-          await Promise.race([
-            new Promise((resolve) => session.encoder.addEventListener('dequeue', resolve, { once: true })),
-            delay(500),
-          ]);
-        }
-        if (!session.stopped) {
-          encoderFrame = resizeFrameForEncoder(session, sourceFrame);
-          const keyframeIntervalFrames = Math.max(
-            1,
-            Math.round(FPS * KEYFRAME_INTERVAL_SECONDS),
-          );
-          const keyFrame = session.needsKeyFrame ||
-            session.framesSubmitted % keyframeIntervalFrames === 0;
-          session.encoder.encode(encoderFrame, { keyFrame });
-          session.needsKeyFrame = false;
-          session.framesSubmitted += 1;
-          if (keyFrame) {
-            log(session.framesSubmitted === 1
-              ? 'Submitted initial keyframe'
-              : 'Submitted periodic keyframe', {
-              timestamp: encoderFrame.timestamp,
-              frameNumber: session.framesSubmitted,
-              intervalSeconds: KEYFRAME_INTERVAL_SECONDS,
-              sourceCodedWidth: sourceFrame.codedWidth,
-              sourceCodedHeight: sourceFrame.codedHeight,
-              encodedCodedWidth: encoderFrame.codedWidth,
-              encodedCodedHeight: encoderFrame.codedHeight,
-            });
-          }
-        }
-      } finally {
-        if (encoderFrame !== sourceFrame) encoderFrame.close();
-        sourceFrame.close();
-      }
+    frame = captureFrame(session, timestamp);
+    const keyFrame = session.lastKeyFrameTimestamp === null ||
+      timestamp - session.lastKeyFrameTimestamp >= KEYFRAME_INTERVAL_SECONDS * 1e6;
+    session.encoder.encode(frame, { keyFrame });
+    session.framesSubmitted += 1;
+    if (keyFrame) {
+      session.lastKeyFrameTimestamp = timestamp;
+      log(session.framesSubmitted === 1
+        ? 'Submitted initial keyframe'
+        : 'Submitted periodic keyframe', {
+        timestamp,
+        frameNumber: session.framesSubmitted,
+        intervalSeconds: KEYFRAME_INTERVAL_SECONDS,
+        sourceWidth: captureVideo.videoWidth,
+        sourceHeight: captureVideo.videoHeight,
+        encodedCodedWidth: frame.codedWidth,
+        encodedCodedHeight: frame.codedHeight,
+      });
     }
   } catch (error) {
     if (!session.stopped) {
+      session.clock.stop();
       logError('Capture-to-encoder pipeline failed', error);
       setStatus(`Capture pipeline error: ${error.message}`, 'warn');
       session.socket.close(4102, 'capture pipeline error');
     }
+  } finally {
+    frame?.close();
   }
 }
 
-function resizeFrameForEncoder(session, sourceFrame) {
+function captureFrame(session, timestamp) {
   const targetWidth = session.codecChoice.config.width;
   const targetHeight = session.codecChoice.config.height;
+  const sourceWidth = captureVideo.videoWidth;
+  const sourceHeight = captureVideo.videoHeight;
+  const frameInit = { timestamp, duration: FRAME_DURATION_MICROSECONDS };
 
-  if (sourceFrame.codedWidth === targetWidth && sourceFrame.codedHeight === targetHeight) {
-    return sourceFrame;
+  if (sourceWidth === targetWidth && sourceHeight === targetHeight) {
+    return new VideoFrame(captureVideo, frameInit);
   }
 
   if (!session.resizeCanvas) {
@@ -750,8 +780,6 @@ function resizeFrameForEncoder(session, sourceFrame) {
     }
   }
 
-  const sourceWidth = sourceFrame.displayWidth || sourceFrame.codedWidth;
-  const sourceHeight = sourceFrame.displayHeight || sourceFrame.codedHeight;
   const scale = Math.min(targetWidth / sourceWidth, targetHeight / sourceHeight);
   const drawWidth = Math.round(sourceWidth * scale);
   const drawHeight = Math.round(sourceHeight * scale);
@@ -760,23 +788,19 @@ function resizeFrameForEncoder(session, sourceFrame) {
 
   session.resizeContext.fillStyle = 'black';
   session.resizeContext.fillRect(0, 0, targetWidth, targetHeight);
-  session.resizeContext.drawImage(sourceFrame, drawX, drawY, drawWidth, drawHeight);
+  session.resizeContext.drawImage(captureVideo, drawX, drawY, drawWidth, drawHeight);
 
   if (!session.resizeLogged) {
     session.resizeLogged = true;
     log('Using canvas frame resize fallback', {
-      sourceCodedWidth: sourceFrame.codedWidth,
-      sourceCodedHeight: sourceFrame.codedHeight,
-      sourceDisplayWidth: sourceWidth,
-      sourceDisplayHeight: sourceHeight,
+      sourceWidth,
+      sourceHeight,
       targetWidth,
       targetHeight,
       contentRectangle: { x: drawX, y: drawY, width: drawWidth, height: drawHeight },
     });
   }
 
-  const frameInit = { timestamp: sourceFrame.timestamp };
-  if (sourceFrame.duration != null) frameInit.duration = sourceFrame.duration;
   return new VideoFrame(session.resizeCanvas, frameInit);
 }
 
@@ -792,16 +816,7 @@ async function stopEncoder(graceful) {
     chunksSent: session.chunksSent,
     bytesSent: session.bytesSent,
   });
-  try {
-    await session.reader.cancel();
-  } catch (error) {
-    logWarning('Frame reader cancellation failed', error);
-  }
-  try {
-    await session.done;
-  } catch (error) {
-    logWarning('Frame pump ended with an error', error);
-  }
+  session.clock?.stop();
   if (graceful && session.encoder.state === 'configured') {
     const flushed = await Promise.race([
       session.encoder.flush().then(() => true),
@@ -824,14 +839,15 @@ async function stopEncoder(graceful) {
 const requiredAPIs = {
   getDisplayMedia: Boolean(navigator.mediaDevices?.getDisplayMedia),
   VideoEncoder: Boolean(window.VideoEncoder),
-  MediaStreamTrackProcessor: Boolean(window.MediaStreamTrackProcessor),
+  VideoFrame: Boolean(window.VideoFrame),
+  Worker: Boolean(window.Worker),
   mediaCapabilitiesEncoding: Boolean(navigator.mediaCapabilities?.encodingInfo),
 };
 log('Client initialized', { fps: FPS, bitrate: BITRATE, requiredAPIs });
 
 if (!requiredAPIs.getDisplayMedia || !requiredAPIs.VideoEncoder ||
-    !requiredAPIs.MediaStreamTrackProcessor) {
-  setStatus('This Chrome does not support the required screen-capture WebCodecs APIs.', 'warn');
+    !requiredAPIs.VideoFrame || !requiredAPIs.Worker) {
+  setStatus('This browser does not support the required screen-capture WebCodecs APIs.', 'warn');
   login.querySelector('button').disabled = true;
   logError('Required browser APIs are missing', requiredAPIs);
 }
