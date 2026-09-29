@@ -486,6 +486,13 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			if err := file.Close(); err != nil {
 				log.Printf("close recording for %s: %v", cmd.Username, err)
 			}
+			if info, err := os.Stat(file.Name()); err == nil && info.Size() == 0 {
+				if err := os.Remove(file.Name()); err != nil {
+					log.Printf("remove empty recording for %s: %v", cmd.Username, err)
+				} else {
+					log.Printf("removed empty recording: user=%q path=%q", cmd.Username, recordingPath)
+				}
+			}
 		}
 	}()
 	for {
