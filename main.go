@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"crypto/subtle"
@@ -234,7 +235,11 @@ func main() {
 	errCh := make(chan error, 2)
 	serve := func(httpServer *http.Server) error {
 		if cfg.certFile != "" {
-			return httpServer.ListenAndServeTLS(cfg.certFile, cfg.keyFile)
+			ln, err := net.Listen("tcp", httpServer.Addr)
+			if err != nil {
+				return err
+			}
+			return httpServer.ServeTLS(newRedirectListener(ln), cfg.certFile, cfg.keyFile)
 		}
 		return httpServer.ListenAndServe()
 	}
@@ -806,3 +811,87 @@ func (w *webSocket) writeFrame(op byte, payload []byte) error {
 func isExpectedClose(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "connection reset")
 }
+
+// redirectListener hands TLS connections to the server and answers plain
+// HTTP requests on the same port with a redirect to https.
+type redirectListener struct {
+	net.Listener
+	conns chan net.Conn
+	errCh chan error
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newRedirectListener(ln net.Listener) *redirectListener {
+	l := &redirectListener{Listener: ln, conns: make(chan net.Conn), errCh: make(chan error, 1), done: make(chan struct{})}
+	go l.acceptLoop()
+	return l
+}
+
+func (l *redirectListener) acceptLoop() {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			l.errCh <- err
+			return
+		}
+		go l.sniff(conn)
+	}
+}
+
+func (l *redirectListener) sniff(conn net.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	first, err := br.Peek(1)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	if first[0] == 0x16 {
+		_ = conn.SetReadDeadline(time.Time{})
+		select {
+		case l.conns <- &peekedConn{Conn: conn, r: br}:
+		case <-l.done:
+			conn.Close()
+		}
+		return
+	}
+	defer conn.Close()
+	req, err := http.ReadRequest(br)
+	if err != nil || req.Host == "" {
+		return
+	}
+	target := "https://" + req.Host + req.URL.RequestURI()
+	resp := &http.Response{
+		StatusCode: http.StatusPermanentRedirect,
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     http.Header{"Location": {target}, "Connection": {"close"}},
+		Close:      true,
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = resp.Write(conn)
+}
+
+func (l *redirectListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case err := <-l.errCh:
+		return nil, err
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *redirectListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+type peekedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *peekedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
