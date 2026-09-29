@@ -9,8 +9,8 @@ cp users.csv.example users.csv
 go run . --path ./recordings --users ./users.csv
 ```
 
-- Recorder: `http://localhost:8080`
-- Dashboard: `http://localhost:8081`
+- Recorder: `http://localhost:8888`
+- Dashboard: `http://localhost:8889`
 
 Chrome permits screen capture on `localhost`. For access from other machines, put both ports behind HTTPS (the recorder's WebSocket will automatically use `wss://`). The dashboard is intentionally unauthenticated, so restrict it at the reverse proxy or firewall if needed.
 
@@ -20,8 +20,8 @@ Chrome permits screen capture on `localhost`. For access from other machines, pu
 --path string               recording directory (default "recordings")
 --users string              username,password CSV (default "users.csv")
 --log string                append-only log file (default "log.txt")
---listen string             recorder address (default ":8080")
---dashboard-listen string   dashboard address (default ":8081")
+--listen string             recorder address (default ":8888")
+--dashboard-listen string   dashboard address (default ":8889")
 --cert string               TLS certificate chain (for example, Certbot fullchain.pem)
 --key string                TLS private key (for example, Certbot privkey.pem)
 --fps int                   capture frame rate
@@ -38,7 +38,7 @@ go run . \
   --users ./users.csv
 ```
 
-Both the recorder and dashboard use TLS when these options are set. They are then available at `https://recorder.example.com:8080` and `https://recorder.example.com:8081` with the default listen addresses. The process must have read permission for both Certbot files. Restart the process after certificate renewal so Go reloads the renewed certificate.
+Both the recorder and dashboard use TLS when these options are set. They are then available at `https://recorder.example.com:8888` and `https://recorder.example.com:8889` with the default listen addresses. The process must have read permission for both Certbot files. Restart the process after certificate renewal so Go reloads the renewed certificate.
 
 Usernames may contain letters, digits, `.`, `_`, and `-`, must begin with a letter or digit, and are limited to 64 characters. The optional CSV header is `username,password`. Quote fields using normal CSV syntax when a password contains a comma.
 
