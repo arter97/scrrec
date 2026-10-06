@@ -24,6 +24,8 @@
     .preview.shown { display: flex; flex-direction: column; gap: 12px; }
     .preview-name { padding: 8px 18px; background: #11192b; border: 1px solid #43d68a; border-radius: 999px; color: #fff; font-size: 1.6rem; font-weight: 800; overflow-wrap: anywhere; text-align: center; max-width: 90vw; }
     .preview canvas { max-width: 96vw; max-height: calc(96vh - 4.5rem); border-radius: 6px; box-shadow: 0 10px 40px #000; }
+    .client.idle { background: #321c24; border-left-color: #ff5c7a; }
+    .client.idle .rate { color: #ff8ea7; font-weight: 700; }
     .rate { float: right; color: #94a1c4; font-size: .85rem; font-variant-numeric: tabular-nums; }
     .user { font-size: .95rem; font-weight: 700; overflow-wrap: anywhere; }
     .empty { margin-top: 14px; color: #8390ad; }
@@ -130,6 +132,7 @@
           clientElements.set(client.id, entry);
         }
         entry.username = client.username;
+        entry.element.classList.toggle('idle', !client.rate);
         entry.rate.textContent = `${((client.rate || 0) / 1000).toFixed(1)} kB/s`;
         if (client.thumb && client.thumb !== entry.thumb) {
           entry.thumb = client.thumb;
