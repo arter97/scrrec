@@ -7,7 +7,7 @@
   <style>
     :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #0a0f1c; color: #eef2ff; }
     body { margin: 0; padding: 32px; }
-    .wrap { max-width: 1100px; margin: auto; }
+    .wrap { margin: auto; }
     header { display: flex; justify-content: space-between; align-items: end; padding-bottom: 18px; border-bottom: 1px solid #28334e; }
     h1, h2 { margin: 0; }
     .connection { color: #94a1c4; }
@@ -20,6 +20,10 @@
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 7px; margin-top: 10px; }
     .client { padding: 7px 10px; background: #182238; border-left: 3px solid #43d68a; border-radius: 6px; }
     .thumb { display: block; width: 100%; aspect-ratio: 16 / 9; margin-top: 6px; background: #0a0f1c; border-radius: 4px; object-fit: contain; }
+    .preview { position: fixed; inset: 0; z-index: 10; display: none; align-items: center; justify-content: center; background: rgba(5, 8, 16, .75); pointer-events: none; }
+    .preview.shown { display: flex; flex-direction: column; gap: 12px; }
+    .preview-name { padding: 8px 18px; background: #11192b; border: 1px solid #43d68a; border-radius: 999px; color: #fff; font-size: 1.6rem; font-weight: 800; overflow-wrap: anywhere; text-align: center; max-width: 90vw; }
+    .preview canvas { max-width: 96vw; max-height: calc(96vh - 4.5rem); border-radius: 6px; box-shadow: 0 10px 40px #000; }
     .rate { float: right; color: #94a1c4; font-size: .85rem; font-variant-numeric: tabular-nums; }
     .user { font-size: .95rem; font-weight: 700; overflow-wrap: anywhere; }
     .empty { margin-top: 14px; color: #8390ad; }
@@ -35,6 +39,7 @@
     <section class="offline"><h2>Not connected</h2><div id="offline" class="names"></div></section>
     <section class="online"><h2>Connected <span id="count" class="count"></span></h2><div id="connected" class="grid"></div></section>
   </main>
+  <div class="preview" id="preview"><div class="preview-name"></div><canvas></canvas></div>
   <script>
     const LOG_PREFIX = '[scrrec dashboard]';
     const offlineElement = document.querySelector('#offline');
@@ -44,6 +49,25 @@
     const summaryElement = document.querySelector('#summary');
     const knownUsers = new Set();
     const clientElements = new Map();
+    const previewElement = document.querySelector('#preview');
+    const previewCanvas = previewElement.querySelector('canvas');
+    const previewName = previewElement.querySelector('.preview-name');
+    let previewEntry = null;
+
+    function showPreview(entry) {
+      previewEntry = entry;
+      if (!entry.canvas.width) return hidePreview();
+      previewName.textContent = entry.username;
+      previewCanvas.width = entry.canvas.width;
+      previewCanvas.height = entry.canvas.height;
+      previewCanvas.getContext('2d').drawImage(entry.canvas, 0, 0);
+      previewElement.classList.add('shown');
+    }
+
+    function hidePreview() {
+      previewEntry = null;
+      previewElement.classList.remove('shown');
+    }
     const emptyConnected = document.createElement('div');
     emptyConnected.className = 'empty';
     emptyConnected.textContent = 'No active recorders.';
@@ -80,6 +104,7 @@
       const live = new Set(clients.map((client) => client.id));
       for (const [id, entry] of clientElements) {
         if (!live.has(id)) {
+          if (previewEntry === entry) hidePreview();
           entry.element.remove();
           clientElements.delete(id);
         }
@@ -98,9 +123,13 @@
           rate.className = 'rate';
           user.append(rate);
           element.append(user, canvas);
-          entry = { element, canvas, rate, thumb: 0, busy: false };
+          entry = { element, canvas, rate, username: client.username, thumb: 0, busy: false };
+          const shown = entry;
+          canvas.addEventListener('mouseenter', () => showPreview(shown));
+          canvas.addEventListener('mouseleave', hidePreview);
           clientElements.set(client.id, entry);
         }
+        entry.username = client.username;
         entry.rate.textContent = `${((client.rate || 0) / 1000).toFixed(1)} kB/s`;
         if (client.thumb && client.thumb !== entry.thumb) {
           entry.thumb = client.thumb;
@@ -111,34 +140,66 @@
       connectedElement.replaceChildren(...(elements.length ? elements : [emptyConnected]));
     }
 
+    // Thumbnails are decoded one at a time; many concurrent (hardware) decoders
+    // can produce corrupted frames.
+    let decodeQueue = Promise.resolve();
+    const decoderConfigs = new Map();
+
+    async function thumbnailDecoderConfig(codec) {
+      if (!decoderConfigs.has(codec)) {
+        decoderConfigs.set(codec, (async () => {
+          for (const hardwareAcceleration of ['prefer-software', 'no-preference']) {
+            const config = { codec, hardwareAcceleration, optimizeForLatency: true };
+            try {
+              if ((await VideoDecoder.isConfigSupported(config)).supported) return config;
+            } catch (error) {
+              // Try the next preference.
+            }
+          }
+          return { codec, optimizeForLatency: true };
+        })());
+      }
+      return decoderConfigs.get(codec);
+    }
+
+    function decodeThumbnail(codec, data, draw) {
+      const job = decodeQueue.then(async () => {
+        const config = await thumbnailDecoderConfig(codec);
+        let decoder = null;
+        try {
+          await new Promise((resolve, reject) => {
+            decoder = new VideoDecoder({ output: draw, error: reject });
+            decoder.configure(config);
+            decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data }));
+            decoder.flush().then(resolve, reject);
+          });
+        } finally {
+          if (decoder && decoder.state !== 'closed') decoder.close();
+        }
+      });
+      decodeQueue = job.catch(() => {});
+      return job;
+    }
+
     async function updateThumbnail(client, entry) {
       if (entry.busy || !('VideoDecoder' in window) || !client.codec) return;
       entry.busy = true;
       const version = entry.thumb;
-      let decoder = null;
       try {
         const response = await fetch(`/thumb?id=${client.id}`, { cache: 'no-store' });
         if (!response.ok) return;
         const data = await response.arrayBuffer();
-        await new Promise((resolve, reject) => {
-          decoder = new VideoDecoder({
-            output: (frame) => {
-              const scale = Math.min(1, 480 / frame.displayWidth);
-              entry.canvas.width = Math.round(frame.displayWidth * scale);
-              entry.canvas.height = Math.round(frame.displayHeight * scale);
-              entry.canvas.getContext('2d').drawImage(frame, 0, 0, entry.canvas.width, entry.canvas.height);
-              frame.close();
-            },
-            error: reject,
-          });
-          decoder.configure({ codec: client.codec, optimizeForLatency: true });
-          decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data }));
-          decoder.flush().then(resolve, reject);
+        await decodeThumbnail(client.codec, data, (frame) => {
+          // Kept at full resolution so the hover preview stays sharp.
+          entry.canvas.width = frame.displayWidth;
+          entry.canvas.height = frame.displayHeight;
+          entry.canvas.getContext('2d').drawImage(frame, 0, 0);
+          frame.close();
+          if (previewEntry === entry) showPreview(entry);
         });
       } catch (error) {
         console.warn(LOG_PREFIX, 'Thumbnail decode failed', client.username, error);
       } finally {
-        if (decoder && decoder.state !== 'closed') decoder.close();
         entry.busy = false;
         if (entry.thumb !== version && clientElements.get(client.id) === entry) updateThumbnail(client, entry);
       }
