@@ -19,6 +19,7 @@
     .count { color: #83e6ae; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 7px; margin-top: 10px; }
     .client { padding: 7px 10px; background: #182238; border-left: 3px solid #43d68a; border-radius: 6px; }
+    .thumb { display: block; width: 100%; aspect-ratio: 16 / 9; margin-top: 6px; background: #0a0f1c; border-radius: 4px; object-fit: contain; }
     .user { font-size: .95rem; font-weight: 700; overflow-wrap: anywhere; }
     .empty { margin-top: 14px; color: #8390ad; }
     @media (max-width: 600px) { body { padding: 18px; } header { align-items: start; flex-direction: column; gap: 8px; } }
@@ -41,6 +42,10 @@
     const countElement = document.querySelector('#count');
     const summaryElement = document.querySelector('#summary');
     const knownUsers = new Set();
+    const clientElements = new Map();
+    const emptyConnected = document.createElement('div');
+    emptyConnected.className = 'empty';
+    emptyConnected.textContent = 'No active recorders.';
 
     function escapeHTML(value) {
       return String(value).replace(/[&<>"']/g, (character) => ({
@@ -62,15 +67,76 @@
         ? offlineNames.map((name) => `<span class="pill">${escapeHTML(name)}</span>`).join('')
         : '<span class="empty">Everyone is connected.</span>';
       countElement.textContent = `(${connectedClients.length})`;
-      connectedElement.innerHTML = connectedClients.length
-        ? connectedClients.map((client) => `
-            <article class="client">
-              <div class="user">${escapeHTML(client.username)} - ${escapeHTML(client.remote)}</div>
-            </article>`).join('')
-        : '<div class="empty">No active recorders.</div>';
+      renderClients(connectedClients);
       summaryElement.textContent = `${offlineNames.length} offline`;
       updatedElement.textContent = `Live · updated ${new Date().toLocaleTimeString()}`;
       console.info(LOG_PREFIX, 'State updated', { offline: offlineNames.length, connected: connectedClients.length });
+    }
+
+    // Client cards are kept across renders so thumbnails are only redrawn
+    // when the server reports a new keyframe.
+    function renderClients(clients) {
+      const live = new Set(clients.map((client) => client.id));
+      for (const [id, entry] of clientElements) {
+        if (!live.has(id)) {
+          entry.element.remove();
+          clientElements.delete(id);
+        }
+      }
+      const elements = clients.map((client) => {
+        let entry = clientElements.get(client.id);
+        if (!entry) {
+          const element = document.createElement('article');
+          element.className = 'client';
+          const user = document.createElement('div');
+          user.className = 'user';
+          user.textContent = client.username;
+          const canvas = document.createElement('canvas');
+          canvas.className = 'thumb';
+          element.append(user, canvas);
+          entry = { element, canvas, thumb: 0, busy: false };
+          clientElements.set(client.id, entry);
+        }
+        if (client.thumb && client.thumb !== entry.thumb) {
+          entry.thumb = client.thumb;
+          updateThumbnail(client, entry);
+        }
+        return entry.element;
+      });
+      connectedElement.replaceChildren(...(elements.length ? elements : [emptyConnected]));
+    }
+
+    async function updateThumbnail(client, entry) {
+      if (entry.busy || !('VideoDecoder' in window) || !client.codec) return;
+      entry.busy = true;
+      const version = entry.thumb;
+      let decoder = null;
+      try {
+        const response = await fetch(`/thumb?id=${client.id}`, { cache: 'no-store' });
+        if (!response.ok) return;
+        const data = await response.arrayBuffer();
+        await new Promise((resolve, reject) => {
+          decoder = new VideoDecoder({
+            output: (frame) => {
+              const scale = Math.min(1, 480 / frame.displayWidth);
+              entry.canvas.width = Math.round(frame.displayWidth * scale);
+              entry.canvas.height = Math.round(frame.displayHeight * scale);
+              entry.canvas.getContext('2d').drawImage(frame, 0, 0, entry.canvas.width, entry.canvas.height);
+              frame.close();
+            },
+            error: reject,
+          });
+          decoder.configure({ codec: client.codec, optimizeForLatency: true });
+          decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data }));
+          decoder.flush().then(resolve, reject);
+        });
+      } catch (error) {
+        console.warn(LOG_PREFIX, 'Thumbnail decode failed', client.username, error);
+      } finally {
+        if (decoder && decoder.state !== 'closed') decoder.close();
+        entry.busy = false;
+        if (entry.thumb !== version && clientElements.get(client.id) === entry) updateThumbnail(client, entry);
+      }
     }
 
     function markDisconnected() {

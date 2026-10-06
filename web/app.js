@@ -284,7 +284,12 @@ async function beginServerRecording(socket) {
     await prepareCapture();
     if (socket === websocket && socket.readyState === WebSocket.OPEN) {
       log('Requesting raw recording file', { codec: selectedCodec.name, format: 'annexb' });
-      sendCommand({ type: 'start', codec: selectedCodec.name, format: 'annexb' });
+      sendCommand({
+        type: 'start',
+        codec: selectedCodec.name,
+        codecString: selectedCodec.config.codec,
+        format: 'annexb',
+      });
     }
   } catch (error) {
     starting = false;

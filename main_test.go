@@ -79,3 +79,16 @@ func TestRemoteIP(t *testing.T) {
 		}
 	}
 }
+
+func TestIsKeyframe(t *testing.T) {
+	h264IDR := []byte{0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 1, 0x65, 0x88}
+	h264P := []byte{0, 0, 0, 1, 0x41, 0x9a}
+	hevcIDR := []byte{0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 1, 0x26, 0x01, 0xaf}
+	hevcP := []byte{0, 0, 0, 1, 0x02, 0x01, 0xd0}
+	if !isKeyframe("h264", h264IDR) || isKeyframe("h264", h264P) {
+		t.Fatal("h264 keyframe detection failed")
+	}
+	if !isKeyframe("hevc", hevcIDR) || isKeyframe("hevc", hevcP) {
+		t.Fatal("hevc keyframe detection failed")
+	}
+}

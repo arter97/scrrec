@@ -35,6 +35,8 @@ const (
 	clientTimeout  = 30 * time.Second
 )
 
+var validCodecString = regexp.MustCompile(`^(avc1|avc3|hvc1|hev1)\.[A-Za-z0-9.]{1,48}$`)
+
 var validUsername = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 type config struct {
@@ -66,7 +68,8 @@ type clientInfo struct {
 	ID        uint64    `json:"id"`
 	Username  string    `json:"username"`
 	Filename  string    `json:"filename,omitempty"`
-	Remote    string    `json:"remote"`
+	Codec     string    `json:"codec,omitempty"`
+	Thumb     uint64    `json:"thumb,omitempty"`
 	Connected time.Time `json:"connected"`
 	LastSeen  time.Time `json:"lastSeen"`
 }
@@ -80,6 +83,7 @@ type presenceHub struct {
 	mu      sync.RWMutex
 	users   []string
 	clients map[uint64]clientInfo
+	thumbs  map[uint64][]byte
 	watch   map[chan struct{}]struct{}
 }
 
@@ -89,7 +93,7 @@ func newPresenceHub(users map[string]string) *presenceHub {
 		names = append(names, name)
 	}
 	sortStrings(names)
-	return &presenceHub{users: names, clients: make(map[uint64]clientInfo), watch: make(map[chan struct{}]struct{})}
+	return &presenceHub{users: names, clients: make(map[uint64]clientInfo), thumbs: make(map[uint64][]byte), watch: make(map[chan struct{}]struct{})}
 }
 
 func (h *presenceHub) set(c clientInfo) {
@@ -102,6 +106,7 @@ func (h *presenceHub) set(c clientInfo) {
 func (h *presenceHub) remove(id uint64) {
 	h.mu.Lock()
 	delete(h.clients, id)
+	delete(h.thumbs, id)
 	h.signalLocked()
 	h.mu.Unlock()
 }
@@ -115,10 +120,30 @@ func (h *presenceHub) touch(id uint64) {
 	h.mu.Unlock()
 }
 
-func (h *presenceHub) filename(id uint64, filename string) {
+// keyframe stores the latest keyframe of a client as its thumbnail source.
+func (h *presenceHub) keyframe(id uint64, data []byte) {
+	h.mu.Lock()
+	if c, ok := h.clients[id]; ok {
+		c.Thumb++
+		h.clients[id] = c
+		h.thumbs[id] = data
+		h.signalLocked()
+	}
+	h.mu.Unlock()
+}
+
+func (h *presenceHub) thumbnail(id uint64) ([]byte, string, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	data, ok := h.thumbs[id]
+	return data, h.clients[id].Codec, ok
+}
+
+func (h *presenceHub) filename(id uint64, filename, codec string) {
 	h.mu.Lock()
 	if c, ok := h.clients[id]; ok {
 		c.Filename = filename
+		c.Codec = codec
 		c.LastSeen = time.Now()
 		h.clients[id] = c
 		h.signalLocked()
@@ -235,6 +260,7 @@ func main() {
 	dashboardMux := http.NewServeMux()
 	dashboardMux.HandleFunc("/", s.serveDashboard)
 	dashboardMux.HandleFunc("/events", s.serveEvents)
+	dashboardMux.HandleFunc("/thumb", s.serveThumb)
 
 	recorderHTTP := &http.Server{Addr: cfg.listen, Handler: securityHeaders(recorderMux), ReadHeaderTimeout: 5 * time.Second}
 	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: securityHeaders(basicAuth(cfg.dashboardPass, dashboardMux)), ReadHeaderTimeout: 5 * time.Second}
@@ -436,7 +462,7 @@ func (s *server) authenticate(username, password string) bool {
 	return subtle.ConstantTimeCompare([]byte(want), []byte(password)) == 1
 }
 
-type command struct{ Type, Username, Password, Codec, Format string }
+type command struct{ Type, Username, Password, Codec, CodecString, Format string }
 
 func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgradeWebSocket(w, r)
@@ -467,7 +493,7 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	id := s.seq.Add(1)
 	now := time.Now()
 	remote := remoteIP(r.RemoteAddr)
-	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Remote: remote, Connected: now, LastSeen: now})
+	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Connected: now, LastSeen: now})
 	defer s.hub.remove(id)
 	recordingPath := ""
 	log.Printf("client connected: user=%q ip=%q", cmd.Username, remote)
@@ -506,6 +532,7 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	var file *os.File
+	var codec string
 	defer func() {
 		if file != nil {
 			if err := file.Close(); err != nil {
@@ -546,13 +573,17 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 				ws.writeClose(4500, "cannot create recording")
 				return
 			}
+			codec = strings.ToLower(next.Codec)
+			if !validCodecString.MatchString(next.CodecString) {
+				next.CodecString = ""
+			}
 			recordingPath = file.Name()
 			if absolutePath, absoluteErr := filepath.Abs(recordingPath); absoluteErr == nil {
 				recordingPath = absolutePath
 			}
 			log.Printf("recording started: user=%q ip=%q path=%q", cmd.Username, remote, recordingPath)
 			name := filepath.Base(file.Name())
-			s.hub.filename(id, name)
+			s.hub.filename(id, name, next.CodecString)
 			if err := ws.writeJSON(map[string]any{"type": "start-ok", "filename": name}); err != nil {
 				return
 			}
@@ -566,8 +597,34 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 				ws.writeClose(4501, "write failed")
 				return
 			}
+			if isKeyframe(codec, data) {
+				s.hub.keyframe(id, data)
+			}
 		}
 	}
+}
+
+// isKeyframe reports whether an Annex B access unit contains an IDR (H.264)
+// or IRAP (HEVC) NAL unit.
+func isKeyframe(codec string, data []byte) bool {
+	for i := 0; i+3 < len(data); i++ {
+		if data[i] != 0 || data[i+1] != 0 || data[i+2] != 1 {
+			continue
+		}
+		header := data[i+3]
+		switch codec {
+		case "h264":
+			if header&0x1f == 5 {
+				return true
+			}
+		case "hevc":
+			if t := (header >> 1) & 0x3f; t >= 16 && t <= 21 {
+				return true
+			}
+		}
+		i += 2
+	}
+	return false
 }
 
 func remoteIP(remoteAddr string) string {
@@ -616,6 +673,23 @@ func (s *server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, dashboardHTML)
+}
+
+func (s *server) serveThumb(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.URL.Query().Get("id"), 10, 64)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	data, codec, ok := s.hub.thumbnail(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Codec", codec)
+	_, _ = w.Write(data)
 }
 
 func (s *server) serveEvents(w http.ResponseWriter, r *http.Request) {
