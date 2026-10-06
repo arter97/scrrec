@@ -20,6 +20,7 @@
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 7px; margin-top: 10px; }
     .client { padding: 7px 10px; background: #182238; border-left: 3px solid #43d68a; border-radius: 6px; }
     .thumb { display: block; width: 100%; aspect-ratio: 16 / 9; margin-top: 6px; background: #0a0f1c; border-radius: 4px; object-fit: contain; }
+    .rate { float: right; color: #94a1c4; font-size: .85rem; font-variant-numeric: tabular-nums; }
     .user { font-size: .95rem; font-weight: 700; overflow-wrap: anywhere; }
     .empty { margin-top: 14px; color: #8390ad; }
     @media (max-width: 600px) { body { padding: 18px; } header { align-items: start; flex-direction: column; gap: 8px; } }
@@ -93,10 +94,14 @@
           user.textContent = client.username;
           const canvas = document.createElement('canvas');
           canvas.className = 'thumb';
+          const rate = document.createElement('span');
+          rate.className = 'rate';
+          user.append(rate);
           element.append(user, canvas);
-          entry = { element, canvas, thumb: 0, busy: false };
+          entry = { element, canvas, rate, thumb: 0, busy: false };
           clientElements.set(client.id, entry);
         }
+        entry.rate.textContent = `${((client.rate || 0) / 1000).toFixed(1)} kB/s`;
         if (client.thumb && client.thumb !== entry.thumb) {
           entry.thumb = client.thumb;
           updateThumbnail(client, entry);

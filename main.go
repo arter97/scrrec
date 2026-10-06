@@ -70,6 +70,7 @@ type clientInfo struct {
 	Filename  string    `json:"filename,omitempty"`
 	Codec     string    `json:"codec,omitempty"`
 	Thumb     uint64    `json:"thumb,omitempty"`
+	Rate      float64   `json:"rate"` // bytes per second over rateWindow
 	Connected time.Time `json:"connected"`
 	LastSeen  time.Time `json:"lastSeen"`
 }
@@ -84,6 +85,7 @@ type presenceHub struct {
 	users   []string
 	clients map[uint64]clientInfo
 	thumbs  map[uint64][]byte
+	traffic map[uint64]*traffic
 	watch   map[chan struct{}]struct{}
 }
 
@@ -93,7 +95,7 @@ func newPresenceHub(users map[string]string) *presenceHub {
 		names = append(names, name)
 	}
 	sortStrings(names)
-	return &presenceHub{users: names, clients: make(map[uint64]clientInfo), thumbs: make(map[uint64][]byte), watch: make(map[chan struct{}]struct{})}
+	return &presenceHub{users: names, clients: make(map[uint64]clientInfo), thumbs: make(map[uint64][]byte), traffic: make(map[uint64]*traffic), watch: make(map[chan struct{}]struct{})}
 }
 
 func (h *presenceHub) set(c clientInfo) {
@@ -107,6 +109,7 @@ func (h *presenceHub) remove(id uint64) {
 	h.mu.Lock()
 	delete(h.clients, id)
 	delete(h.thumbs, id)
+	delete(h.traffic, id)
 	h.signalLocked()
 	h.mu.Unlock()
 }
@@ -118,6 +121,56 @@ func (h *presenceHub) touch(id uint64) {
 		h.clients[id] = c
 	}
 	h.mu.Unlock()
+}
+
+// rateWindow is the number of one-second buckets averaged for the rate.
+const rateWindow = 3
+
+type traffic struct {
+	current int64
+	buckets [rateWindow]int64
+	next    int
+}
+
+func (h *presenceHub) received(id uint64, n int) {
+	h.mu.Lock()
+	if t := h.traffic[id]; t != nil {
+		t.current += int64(n)
+	} else if _, ok := h.clients[id]; ok {
+		h.traffic[id] = &traffic{current: int64(n)}
+	}
+	h.mu.Unlock()
+}
+
+// sampleRates closes the current one-second bucket of every client and
+// notifies watchers if any displayed rate changed.
+func (h *presenceHub) sampleRates() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	changed := false
+	for id, c := range h.clients {
+		t := h.traffic[id]
+		if t == nil {
+			t = &traffic{}
+			h.traffic[id] = t
+		}
+		t.buckets[t.next] = t.current
+		t.next = (t.next + 1) % rateWindow
+		t.current = 0
+		var sum int64
+		for _, b := range t.buckets {
+			sum += b
+		}
+		rate := float64(sum) / rateWindow
+		if rate != c.Rate {
+			c.Rate = rate
+			h.clients[id] = c
+			changed = true
+		}
+	}
+	if changed {
+		h.signalLocked()
+	}
 }
 
 // keyframe stores the latest keyframe of a client as its thumbnail source.
@@ -253,6 +306,18 @@ func main() {
 		stopCh:  make(chan struct{}),
 		sockets: make(map[*webSocket]struct{}),
 	}
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				s.hub.sampleRates()
+			case <-s.stopCh:
+				return
+			}
+		}
+	}()
 	recorderMux := http.NewServeMux()
 	recorderMux.HandleFunc("/", s.serveRecorder)
 	recorderMux.HandleFunc("/app.js", s.serveAppJS)
@@ -597,6 +662,7 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 				ws.writeClose(4501, "write failed")
 				return
 			}
+			s.hub.received(id, len(data))
 			if isKeyframe(codec, data) {
 				s.hub.keyframe(id, data)
 			}
