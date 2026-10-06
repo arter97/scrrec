@@ -266,7 +266,9 @@ function connect() {
     websocket = null;
     await stopEncoder(false);
     starting = false;
-    if (!intentionallyStopped) {
+    if (event.code === 4005) {
+      stopEverything('Another session for this user connected; this one was closed');
+    } else if (!intentionallyStopped) {
       setStatus('Connection lost; reconnecting…', 'warn');
       log('Scheduling reconnect', { delayMilliseconds: reconnectDelay });
       reconnectTimer = setTimeout(connect, reconnectDelay);

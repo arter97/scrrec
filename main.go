@@ -60,6 +60,7 @@ type server struct {
 	stopCh   chan struct{}
 	wsMu     sync.Mutex
 	sockets  map[*webSocket]struct{}
+	active   map[string]*webSocket // latest authenticated socket per user
 	wsWG     sync.WaitGroup
 	stopping bool
 }
@@ -308,6 +309,7 @@ func main() {
 		hub:     newPresenceHub(users),
 		stopCh:  make(chan struct{}),
 		sockets: make(map[*webSocket]struct{}),
+		active:  make(map[string]*webSocket),
 	}
 	go func() {
 		t := time.NewTicker(time.Second)
@@ -398,6 +400,27 @@ func (s *server) trackWebSocket(ws *webSocket) bool {
 	s.sockets[ws] = struct{}{}
 	s.wsWG.Add(1)
 	return true
+}
+
+// replaceActive makes ws the user's active socket and closes any older one.
+func (s *server) replaceActive(username string, ws *webSocket, remote string) {
+	s.wsMu.Lock()
+	old := s.active[username]
+	s.active[username] = ws
+	s.wsMu.Unlock()
+	if old != nil {
+		log.Printf("closing older connection: user=%q replaced by ip=%q", username, remote)
+		old.writeClose(4005, "replaced by newer connection")
+		old.close()
+	}
+}
+
+func (s *server) releaseActive(username string, ws *webSocket) {
+	s.wsMu.Lock()
+	if s.active[username] == ws {
+		delete(s.active, username)
+	}
+	s.wsMu.Unlock()
 }
 
 func (s *server) untrackWebSocket(ws *webSocket) {
@@ -561,6 +584,8 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	id := s.seq.Add(1)
 	now := time.Now()
 	remote := remoteIP(r.RemoteAddr)
+	s.replaceActive(cmd.Username, ws, remote)
+	defer s.releaseActive(cmd.Username, ws)
 	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Connected: now, LastSeen: now})
 	defer s.hub.remove(id)
 	recordingPath := ""
