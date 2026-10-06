@@ -188,7 +188,7 @@ async function stopEverything(message) {
   await stopEncoder(true);
 
   if (activeSocket?.readyState === WebSocket.OPEN) {
-    const drainDeadline = Date.now() + 5000;
+    const drainDeadline = Date.now() + 30000;
     while (activeSocket.bufferedAmount > 0 && Date.now() < drainDeadline) {
       await delay(50);
     }

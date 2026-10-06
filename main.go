@@ -32,7 +32,7 @@ import (
 const (
 	maxMessageSize = 32 << 20
 	pingInterval   = 10 * time.Second
-	clientTimeout  = 30 * time.Second
+	clientTimeout  = 3 * time.Minute
 )
 
 var validCodecString = regexp.MustCompile(`^(avc1|avc3|hvc1|hev1)\.[A-Za-z0-9.]{1,48}$`)
@@ -330,8 +330,8 @@ func main() {
 	dashboardMux.HandleFunc("/events", s.serveEvents)
 	dashboardMux.HandleFunc("/thumb", s.serveThumb)
 
-	recorderHTTP := &http.Server{Addr: cfg.listen, Handler: securityHeaders(recorderMux), ReadHeaderTimeout: 5 * time.Second}
-	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: securityHeaders(basicAuth(cfg.dashboardPass, dashboardMux)), ReadHeaderTimeout: 5 * time.Second}
+	recorderHTTP := &http.Server{Addr: cfg.listen, Handler: securityHeaders(recorderMux), ReadHeaderTimeout: 60 * time.Second}
+	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: securityHeaders(basicAuth(cfg.dashboardPass, dashboardMux)), ReadHeaderTimeout: 60 * time.Second}
 	errCh := make(chan error, 2)
 	serve := func(httpServer *http.Server) error {
 		if cfg.certFile != "" {
@@ -545,7 +545,7 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.untrackWebSocket(ws)
 	defer ws.close()
-	_ = ws.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = ws.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	op, data, err := ws.readMessage()
 	if err != nil || op != opText {
 		ws.writeClose(4000, "authentication required")
@@ -954,7 +954,7 @@ func (w *webSocket) close() { _ = w.conn.Close() }
 func (w *webSocket) writeFrame(op byte, payload []byte) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
-	_ = w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = w.conn.SetWriteDeadline(time.Now().Add(2 * time.Minute))
 	h := []byte{0x80 | op}
 	n := len(payload)
 	if n < 126 {
@@ -1003,7 +1003,7 @@ func (l *redirectListener) acceptLoop() {
 }
 
 func (l *redirectListener) sniff(conn net.Conn) {
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	br := bufio.NewReader(conn)
 	first, err := br.Peek(1)
 	if err != nil {
@@ -1032,7 +1032,7 @@ func (l *redirectListener) sniff(conn net.Conn) {
 		Header:     http.Header{"Location": {target}, "Connection": {"close"}},
 		Close:      true,
 	}
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 	_ = resp.Write(conn)
 }
 
