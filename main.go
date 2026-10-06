@@ -65,14 +65,15 @@ type server struct {
 }
 
 type clientInfo struct {
-	ID        uint64    `json:"id"`
-	Username  string    `json:"username"`
-	Filename  string    `json:"filename,omitempty"`
-	Codec     string    `json:"codec,omitempty"`
-	Thumb     uint64    `json:"thumb,omitempty"`
-	Rate      float64   `json:"rate"` // bytes per second over rateWindow
-	Connected time.Time `json:"connected"`
-	LastSeen  time.Time `json:"lastSeen"`
+	ID        uint64     `json:"id"`
+	Username  string     `json:"username"`
+	Filename  string     `json:"filename,omitempty"`
+	Codec     string     `json:"codec,omitempty"`
+	Thumb     uint64     `json:"thumb,omitempty"`
+	ThumbAt   *time.Time `json:"thumbAt,omitempty"`
+	Rate      float64    `json:"rate"` // bytes per second over rateWindow
+	Connected time.Time  `json:"connected"`
+	LastSeen  time.Time  `json:"lastSeen"`
 }
 
 type dashboardState struct {
@@ -178,6 +179,8 @@ func (h *presenceHub) keyframe(id uint64, data []byte) {
 	h.mu.Lock()
 	if c, ok := h.clients[id]; ok {
 		c.Thumb++
+		now := time.Now()
+		c.ThumbAt = &now
 		h.clients[id] = c
 		h.thumbs[id] = data
 		h.signalLocked()

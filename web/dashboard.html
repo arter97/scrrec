@@ -23,7 +23,8 @@
     .preview { position: fixed; inset: 0; z-index: 10; display: none; align-items: center; justify-content: center; background: rgba(5, 8, 16, .75); pointer-events: none; }
     .preview.shown { display: flex; flex-direction: column; gap: 12px; }
     .preview-name { padding: 8px 18px; background: #11192b; border: 1px solid #43d68a; border-radius: 999px; color: #fff; font-size: 1.6rem; font-weight: 800; overflow-wrap: anywhere; text-align: center; max-width: 90vw; }
-    .preview canvas { max-width: 96vw; max-height: calc(96vh - 4.5rem); border-radius: 6px; box-shadow: 0 10px 40px #000; }
+    .preview-time { margin-top: -4px; padding: 4px 14px; background: #11192b; border-radius: 999px; color: #eef2ff; font-size: 1.1rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .preview canvas { max-width: 96vw; max-height: calc(96vh - 7rem); border-radius: 6px; box-shadow: 0 10px 40px #000; }
     .client.idle { background: #321c24; border-left-color: #ff5c7a; }
     .client.idle .rate { color: #ff8ea7; font-weight: 700; }
     .rate { float: right; color: #94a1c4; font-size: .85rem; font-variant-numeric: tabular-nums; }
@@ -41,7 +42,7 @@
     <section class="offline"><h2>Not connected</h2><div id="offline" class="names"></div></section>
     <section class="online"><h2>Connected <span id="count" class="count"></span></h2><div id="connected" class="grid"></div></section>
   </main>
-  <div class="preview" id="preview"><div class="preview-name"></div><canvas></canvas></div>
+  <div class="preview" id="preview"><div class="preview-name"></div><div class="preview-time"></div><canvas></canvas></div>
   <script>
     const LOG_PREFIX = '[scrrec dashboard]';
     const offlineElement = document.querySelector('#offline');
@@ -54,12 +55,14 @@
     const previewElement = document.querySelector('#preview');
     const previewCanvas = previewElement.querySelector('canvas');
     const previewName = previewElement.querySelector('.preview-name');
+    const previewTime = previewElement.querySelector('.preview-time');
     let previewEntry = null;
 
     function showPreview(entry) {
       previewEntry = entry;
       if (!entry.canvas.width) return hidePreview();
       previewName.textContent = entry.username;
+      previewTime.textContent = `Last updated at: ${entry.thumbAt ? entry.thumbAt.toLocaleTimeString() : 'unknown'}`;
       previewCanvas.width = entry.canvas.width;
       previewCanvas.height = entry.canvas.height;
       previewCanvas.getContext('2d').drawImage(entry.canvas, 0, 0);
@@ -188,12 +191,14 @@
       if (entry.busy || !('VideoDecoder' in window) || !client.codec) return;
       entry.busy = true;
       const version = entry.thumb;
+      const thumbAt = client.thumbAt ? new Date(client.thumbAt) : null;
       try {
         const response = await fetch(`/thumb?id=${client.id}`, { cache: 'no-store' });
         if (!response.ok) return;
         const data = await response.arrayBuffer();
         await decodeThumbnail(client.codec, data, (frame) => {
           // Kept at full resolution so the hover preview stays sharp.
+          entry.thumbAt = thumbAt;
           entry.canvas.width = frame.displayWidth;
           entry.canvas.height = frame.displayHeight;
           entry.canvas.getContext('2d').drawImage(frame, 0, 0);
