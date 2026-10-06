@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
@@ -42,6 +43,7 @@ type config struct {
 	logFile       string
 	listen        string
 	dashboardAddr string
+	dashboardPass string
 	certFile      string
 	keyFile       string
 	fps           int
@@ -186,6 +188,7 @@ func main() {
 	flag.StringVar(&cfg.logFile, "log", "log.txt", "log file (opened in append mode)")
 	flag.StringVar(&cfg.listen, "listen", ":8888", "recorder listen address")
 	flag.StringVar(&cfg.dashboardAddr, "dashboard-listen", ":8889", "dashboard listen address")
+	flag.StringVar(&cfg.dashboardPass, "p", "", "dashboard HTTP basic auth password (any username, required)")
 	flag.StringVar(&cfg.certFile, "cert", "", "TLS certificate chain file (for example, Certbot fullchain.pem)")
 	flag.StringVar(&cfg.keyFile, "key", "", "TLS private key file (for example, Certbot privkey.pem)")
 	flag.IntVar(&cfg.fps, "fps", 2, "capture frames per second")
@@ -206,6 +209,9 @@ func main() {
 	}
 	if (cfg.certFile == "") != (cfg.keyFile == "") {
 		log.Fatal("invalid TLS settings: --cert and --key must be provided together")
+	}
+	if cfg.dashboardPass == "" {
+		log.Fatal("invalid settings: -p dashboard password is required")
 	}
 	users, err := loadUsers(cfg.usersFile)
 	if err != nil {
@@ -231,7 +237,7 @@ func main() {
 	dashboardMux.HandleFunc("/events", s.serveEvents)
 
 	recorderHTTP := &http.Server{Addr: cfg.listen, Handler: securityHeaders(recorderMux), ReadHeaderTimeout: 5 * time.Second}
-	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: securityHeaders(dashboardMux), ReadHeaderTimeout: 5 * time.Second}
+	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: securityHeaders(basicAuth(cfg.dashboardPass, dashboardMux)), ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 2)
 	serve := func(httpServer *http.Server) error {
 		if cfg.certFile != "" {
@@ -380,6 +386,20 @@ func loadUsers(path string) (map[string]string, error) {
 		return nil, errors.New("no users found")
 	}
 	return users, nil
+}
+
+func basicAuth(password string, next http.Handler) http.Handler {
+	want := sha256.Sum256([]byte(password))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, got, ok := r.BasicAuth()
+		gotSum := sha256.Sum256([]byte(got))
+		if !ok || subtle.ConstantTimeCompare(gotSum[:], want[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="scrrec dashboard", charset="UTF-8"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {

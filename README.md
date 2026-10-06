@@ -6,13 +6,13 @@ A small, dependency-free Go screen-recording server for Chrome. It authenticates
 
 ```sh
 cp users.csv.example users.csv
-go run . --path ./recordings --users ./users.csv
+go run . --path ./recordings --users ./users.csv -p secret
 ```
 
 - Recorder: `http://localhost:8888`
 - Dashboard: `http://localhost:8889`
 
-Chrome permits screen capture on `localhost`. For access from other machines, put both ports behind HTTPS (the recorder's WebSocket will automatically use `wss://`). The dashboard is intentionally unauthenticated, so restrict it at the reverse proxy or firewall if needed.
+Chrome permits screen capture on `localhost`. For access from other machines, put both ports behind HTTPS (the recorder's WebSocket will automatically use `wss://`). The dashboard is protected by HTTP basic auth: any username is accepted, and the password is the one given with `-p`.
 
 ## Options
 
@@ -22,6 +22,7 @@ Chrome permits screen capture on `localhost`. For access from other machines, pu
 --log string                append-only log file (default "log.txt")
 --listen string             recorder address (default ":8888")
 --dashboard-listen string   dashboard address (default ":8889")
+-p string                   dashboard basic auth password (required; any username)
 --cert string               TLS certificate chain (for example, Certbot fullchain.pem)
 --key string                TLS private key (for example, Certbot privkey.pem)
 --fps int                   capture frame rate
@@ -31,7 +32,7 @@ Chrome permits screen capture on `localhost`. For access from other machines, pu
 For direct HTTPS using a Certbot certificate, provide both files:
 
 ```sh
-go run . \
+go run . -p secret \
   --cert /etc/letsencrypt/live/recorder.example.com/fullchain.pem \
   --key /etc/letsencrypt/live/recorder.example.com/privkey.pem \
   --path ./recordings \
