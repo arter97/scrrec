@@ -1,3 +1,1 @@
-username,password
-alice,change-me
-bob,another-password
+username,alias,password

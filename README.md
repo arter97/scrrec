@@ -18,7 +18,7 @@ Chrome permits screen capture on `localhost`. For access from other machines, pu
 
 ```text
 --path string               recording directory (default "recordings")
---users string              username,password CSV (default "users.csv")
+--users string              username,alias,password CSV (default "users.csv")
 --log string                append-only log file (default "log.txt")
 --listen string             recorder address (default ":8888")
 --dashboard-listen string   dashboard address (default ":8889")
@@ -67,7 +67,7 @@ The recorder always streams video over WebTransport to `/wt`. It never falls bac
 
 quic-go may log that it could not raise the UDP receive buffer size. On Linux, raise the limits with `sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000`.
 
-Usernames may contain letters, digits, `.`, `_`, and `-`, must begin with a letter or digit, and are limited to 64 characters. The optional CSV header is `username,password`. Quote fields using normal CSV syntax when a password contains a comma.
+Usernames may contain letters, digits, `.`, `_`, and `-`, must begin with a letter or digit, and are limited to 64 characters. The optional CSV header is `username,alias,password`. The alias is the display name shown on the dashboard. Quote fields using normal CSV syntax when a password contains a comma.
 
 Each WebSocket or WebTransport session creates a new `username-yyyymmdd_hhmmss.h265` or `.h264` file. Collisions get `-2`, `-3`, and so on. Reconnects reuse an active screen-share track when Chrome allows it, but create a new file and encoder session.
 

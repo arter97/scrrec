@@ -78,7 +78,7 @@ func startQUICTestServer(t *testing.T) *quicTestServer {
 	t.Helper()
 	dir := t.TempDir()
 	certFile, keyFile, roots := writeTestCertificate(t, dir)
-	users := map[string]string{"alice": "secret", "bob": "hunter2"}
+	users := map[string]user{"alice": {"alice", "secret"}, "bob": {"bob", "hunter2"}}
 	s := &server{
 		cfg: config{
 			path:          filepath.Join(dir, "recordings"),

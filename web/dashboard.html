@@ -61,7 +61,7 @@
     function showPreview(entry) {
       previewEntry = entry;
       if (!entry.canvas.width) return hidePreview();
-      previewName.textContent = entry.username;
+      previewName.textContent = entry.alias;
       previewTime.textContent = `Last updated at: ${entry.thumbAt ? entry.thumbAt.toLocaleTimeString() : 'unknown'}`;
       previewCanvas.width = entry.canvas.width;
       previewCanvas.height = entry.canvas.height;
@@ -90,9 +90,9 @@
     function render(state) {
       const offlineNames = [...state.offline].sort(compareNames);
       const connectedClients = [...state.connected].sort((left, right) =>
-        compareNames(left.username, right.username) || new Date(left.connected) - new Date(right.connected));
+        compareNames(left.alias, right.alias) || new Date(left.connected) - new Date(right.connected));
       offlineNames.forEach((name) => knownUsers.add(name));
-      connectedClients.forEach((client) => knownUsers.add(client.username));
+      connectedClients.forEach((client) => knownUsers.add(client.alias));
       offlineElement.innerHTML = offlineNames.length
         ? offlineNames.map((name) => `<span class="pill">${escapeHTML(name)}</span>`).join('')
         : '<span class="empty">Everyone is connected.</span>';
@@ -121,20 +121,20 @@
           element.className = 'client';
           const user = document.createElement('div');
           user.className = 'user';
-          user.textContent = client.username;
+          user.textContent = client.alias;
           const canvas = document.createElement('canvas');
           canvas.className = 'thumb';
           const rate = document.createElement('span');
           rate.className = 'rate';
           user.append(rate);
           element.append(user, canvas);
-          entry = { element, canvas, rate, username: client.username, thumb: 0, busy: false };
+          entry = { element, canvas, rate, alias: client.alias, thumb: 0, busy: false };
           const shown = entry;
           canvas.addEventListener('mouseenter', () => showPreview(shown));
           canvas.addEventListener('mouseleave', hidePreview);
           clientElements.set(client.id, entry);
         }
-        entry.username = client.username;
+        entry.alias = client.alias;
         entry.element.classList.toggle('idle', !client.rate);
         const transport = client.transport === 'webtransport' ? 'QUIC · ' : '';
         entry.rate.textContent = `${transport}${((client.rate || 0) / 1000).toFixed(1)} kB/s`;
@@ -207,7 +207,7 @@
           if (previewEntry === entry) showPreview(entry);
         });
       } catch (error) {
-        console.warn(LOG_PREFIX, 'Thumbnail decode failed', client.username, error);
+        console.warn(LOG_PREFIX, 'Thumbnail decode failed', client.alias, error);
       } finally {
         entry.busy = false;
         if (entry.thumb !== version && clientElements.get(client.id) === entry) updateThumbnail(client, entry);

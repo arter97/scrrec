@@ -23,14 +23,14 @@ func TestParseBitrate(t *testing.T) {
 func TestLoadUsers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "users.csv")
-	if err := os.WriteFile(path, []byte("username,password\nalice,secret\nbob,pass phrase\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("username,alias,password\nalice,Alice Kim,secret\nbob,Bob,pass phrase\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	users, err := loadUsers(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if users["alice"] != "secret" || users["bob"] != "pass phrase" {
+	if users["alice"] != (user{"Alice Kim", "secret"}) || users["bob"] != (user{"Bob", "pass phrase"}) {
 		t.Fatalf("unexpected users: %#v", users)
 	}
 }

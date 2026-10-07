@@ -57,7 +57,7 @@ type config struct {
 
 type server struct {
 	cfg      config
-	users    map[string]string
+	users    map[string]user
 	hub      *presenceHub
 	seq      atomic.Uint64
 	stopCh   chan struct{}
@@ -84,7 +84,8 @@ type recorderConn interface {
 
 type clientInfo struct {
 	ID        uint64     `json:"id"`
-	Username  string     `json:"username"`
+	Username  string     `json:"-"`
+	Alias     string     `json:"alias"`
 	Filename  string     `json:"filename,omitempty"`
 	Codec     string     `json:"codec,omitempty"`
 	Transport string     `json:"transport"`
@@ -103,19 +104,26 @@ type dashboardState struct {
 type presenceHub struct {
 	mu      sync.RWMutex
 	users   []string
+	aliases map[string]string
 	clients map[uint64]clientInfo
 	thumbs  map[uint64][]byte
 	traffic map[uint64]*traffic
 	watch   map[chan struct{}]struct{}
 }
 
-func newPresenceHub(users map[string]string) *presenceHub {
+type user struct{ Alias, Password string }
+
+func newPresenceHub(users map[string]user) *presenceHub {
 	names := make([]string, 0, len(users))
 	for name := range users {
 		names = append(names, name)
 	}
 	sortStrings(names)
-	return &presenceHub{users: names, clients: make(map[uint64]clientInfo), thumbs: make(map[uint64][]byte), traffic: make(map[uint64]*traffic), watch: make(map[chan struct{}]struct{})}
+	aliases := make(map[string]string, len(users))
+	for name, u := range users {
+		aliases[name] = u.Alias
+	}
+	return &presenceHub{users: names, aliases: aliases, clients: make(map[uint64]clientInfo), thumbs: make(map[uint64][]byte), traffic: make(map[uint64]*traffic), watch: make(map[chan struct{}]struct{})}
 }
 
 func (h *presenceHub) set(c clientInfo) {
@@ -258,7 +266,7 @@ func (h *presenceHub) snapshot() dashboardState {
 	offline := make([]string, 0)
 	for _, name := range h.users {
 		if !online[name] {
-			offline = append(offline, name)
+			offline = append(offline, h.aliases[name])
 		}
 	}
 	return dashboardState{Offline: offline, Connected: connected}
@@ -284,7 +292,7 @@ func main() {
 	var cfg config
 	var bitrate string
 	flag.StringVar(&cfg.path, "path", "recordings", "directory in which recordings are stored")
-	flag.StringVar(&cfg.usersFile, "users", "users.csv", "username,password CSV file")
+	flag.StringVar(&cfg.usersFile, "users", "users.csv", "username,alias,password CSV file")
 	flag.StringVar(&cfg.logFile, "log", "log.txt", "log file (opened in append mode)")
 	flag.StringVar(&cfg.listen, "listen", ":8888", "recorder listen address")
 	flag.StringVar(&cfg.dashboardAddr, "dashboard-listen", ":8889", "dashboard listen address")
@@ -523,7 +531,7 @@ func parseBitrate(s string) (int, error) {
 	return int(n * mult), nil
 }
 
-func loadUsers(path string) (map[string]string, error) {
+func loadUsers(path string) (map[string]user, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -531,7 +539,7 @@ func loadUsers(path string) (map[string]string, error) {
 	defer f.Close()
 	r := csv.NewReader(f)
 	r.TrimLeadingSpace = true
-	users := make(map[string]string)
+	users := make(map[string]user)
 	for line := 1; ; line++ {
 		rec, err := r.Read()
 		if errors.Is(err, io.EOF) {
@@ -540,15 +548,18 @@ func loadUsers(path string) (map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", line, err)
 		}
-		if len(rec) != 2 {
-			return nil, fmt.Errorf("line %d: expected exactly two columns", line)
+		if len(rec) != 3 {
+			return nil, fmt.Errorf("line %d: expected exactly three columns", line)
 		}
-		name, password := strings.TrimSpace(rec[0]), rec[1]
-		if line == 1 && strings.EqualFold(name, "username") && strings.EqualFold(strings.TrimSpace(password), "password") {
+		name, alias, password := strings.TrimSpace(rec[0]), strings.TrimSpace(rec[1]), rec[2]
+		if line == 1 && strings.EqualFold(name, "username") && strings.EqualFold(alias, "alias") && strings.EqualFold(strings.TrimSpace(password), "password") {
 			continue
 		}
 		if !validUsername.MatchString(name) {
 			return nil, fmt.Errorf("line %d: invalid username %q", line, name)
+		}
+		if alias == "" {
+			return nil, fmt.Errorf("line %d: empty alias", line)
 		}
 		if password == "" {
 			return nil, fmt.Errorf("line %d: empty password", line)
@@ -556,7 +567,7 @@ func loadUsers(path string) (map[string]string, error) {
 		if _, exists := users[name]; exists {
 			return nil, fmt.Errorf("line %d: duplicate username %q", line, name)
 		}
-		users[name] = password
+		users[name] = user{Alias: alias, Password: password}
 	}
 	if len(users) == 0 {
 		return nil, errors.New("no users found")
@@ -610,7 +621,8 @@ func (s *server) serveAppJS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) authenticate(username, password string) bool {
-	want, ok := s.users[username]
+	u, ok := s.users[username]
+	want := u.Password
 	if !ok || len(want) != len(password) {
 		return false
 	}
@@ -656,7 +668,7 @@ func (s *server) serveSession(ws recorderConn, transport, remoteAddr string) {
 	remote := remoteIP(remoteAddr)
 	s.replaceActive(cmd.Username, ws, remote)
 	defer s.releaseActive(cmd.Username, ws)
-	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Transport: transport, Connected: now, LastSeen: now})
+	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Alias: s.users[cmd.Username].Alias, Transport: transport, Connected: now, LastSeen: now})
 	defer s.hub.remove(id)
 	recordingPath := ""
 	log.Printf("client connected: user=%q ip=%q transport=%s", cmd.Username, remote, transport)
