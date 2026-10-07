@@ -1,6 +1,6 @@
 # scrrec
 
-A small, dependency-free Go screen-recording server for Chrome. It authenticates users from a CSV file, requests monitor-only capture, encodes raw Annex-B video with WebCodecs, sends encoded chunks over WebSocket, stores those bytes unchanged, and shows presence on a separate dashboard.
+A small Go screen-recording server for Chrome. It authenticates users from a CSV file, requests monitor-only capture, encodes raw Annex-B video with WebCodecs, sends encoded chunks over WebSocket (or WebTransport over QUIC with `--quic`), stores those bytes unchanged, and shows presence on a separate dashboard. The only third-party dependencies are [quic-go](https://github.com/quic-go/quic-go) and [webtransport-go](https://github.com/quic-go/webtransport-go), which are used only with `--quic`. Building requires Go 1.26.
 
 ## Run
 
@@ -27,6 +27,7 @@ Chrome permits screen capture on `localhost`. For access from other machines, pu
 --key string                TLS private key (for example, Certbot privkey.pem)
 --fps int                   capture frame rate
 --bitrate string            bits/sec; K and M suffixes accepted
+--quic                      also serve HTTP/3 on UDP and record over WebTransport
 ```
 
 For direct HTTPS using a Certbot certificate, provide both files:
@@ -41,9 +42,34 @@ go run . -p secret \
 
 Both the recorder and dashboard use TLS when these options are set. They are then available at `https://recorder.example.com:8888` and `https://recorder.example.com:8889` with the default listen addresses. The process must have read permission for both Certbot files. Restart the process after certificate renewal so Go reloads the renewed certificate.
 
+## QUIC and WebTransport
+
+`--quic` is for networks where long-lived TCP connections stall or get reset. It requires `--cert` and `--key`, and the certificate must chain to a publicly trusted root, such as a Certbot certificate. Chrome refuses QUIC to certificates issued by locally installed CAs, even when it trusts them over TCP.
+
+```sh
+go run . -p secret --quic \
+  --cert /etc/letsencrypt/live/recorder.example.com/fullchain.pem \
+  --key /etc/letsencrypt/live/recorder.example.com/privkey.pem
+```
+
+With `--quic`, both listeners also serve HTTP/3 on the UDP port with the same number. Open those UDP ports in the firewall. TCP keeps working as before, and every TCP and HTTP/3 response carries `Alt-Svc: h3=":<port>"`. After a browser's first visit, it loads the pages, `app.js`, the dashboard event stream and thumbnails over QUIC.
+
+To skip TCP even on the first visit, publish HTTPS DNS records. Browsers that use them, and other HTTP/3 clients that connect over UDP directly (for example `curl --http3-only`), never need TCP. For the default ports:
+
+```text
+_8888._https.recorder.example.com. 300 IN HTTPS 1 recorder.example.com. alpn="h3,h2"
+_8889._https.recorder.example.com. 300 IN HTTPS 1 recorder.example.com. alpn="h3,h2"
+```
+
+For a server on port 443, the record goes on the host name itself rather than on an `_443._https` prefix.
+
+The recorder always streams video over WebTransport to `/wt`. It never falls back to WebSocket: if UDP is blocked, it keeps retrying WebTransport with the usual backoff. Browsers without WebTransport get an error instead of a recorder. Each message on the session's single bidirectional stream is framed as a type byte (1 for JSON, 2 for video), a big-endian uint32 length, and the payload. To end a session, the server sends a `{"type":"close","code":…}` message carrying the same code as the WebSocket close, then FIN, and the browser closes the session with that code. If the browser has not closed the session within 5 seconds, the server closes it. The server never closes the session first, because the session close resets its streams and can discard the messages before it, and Chrome then reports only a lost connection. On a normal Stop, the browser sends FIN after the last chunk. The server's close message arrives after it has written everything up to that FIN, which confirms that the recording is complete. QUIC keep-alives run every 10 seconds, and a connection that receives no packets for 30 seconds is closed. The dashboard labels WebTransport clients with `QUIC`.
+
+quic-go may log that it could not raise the UDP receive buffer size. On Linux, raise the limits with `sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000`.
+
 Usernames may contain letters, digits, `.`, `_`, and `-`, must begin with a letter or digit, and are limited to 64 characters. The optional CSV header is `username,password`. Quote fields using normal CSV syntax when a password contains a comma.
 
-Each WebSocket session creates a new `username-yyyymmdd_hhmmss.h265` or `.h264` file. Collisions get `-2`, `-3`, and so on. Reconnects reuse an active screen-share track when Chrome allows it, but create a new file and encoder session.
+Each WebSocket or WebTransport session creates a new `username-yyyymmdd_hhmmss.h265` or `.h264` file. Collisions get `-2`, `-3`, and so on. Reconnects reuse an active screen-share track when Chrome allows it, but create a new file and encoder session.
 
 Frames are sampled from a hidden `<video>` element playing the capture stream, at the configured FPS, rather than read through `MediaStreamTrackProcessor`, which Safari and Firefox do not expose on the main thread. The sampling clock runs in a dedicated worker because browsers throttle main-thread timers while the recorder tab is in the background. Static screens are therefore still encoded at a steady rate. If the encoder queue backs up, ticks are dropped instead of queued.
 

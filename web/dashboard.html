@@ -136,7 +136,8 @@
         }
         entry.username = client.username;
         entry.element.classList.toggle('idle', !client.rate);
-        entry.rate.textContent = `${((client.rate || 0) / 1000).toFixed(1)} kB/s`;
+        const transport = client.transport === 'webtransport' ? 'QUIC · ' : '';
+        entry.rate.textContent = `${transport}${((client.rate || 0) / 1000).toFixed(1)} kB/s`;
         if (client.thumb && client.thumb !== entry.thumb) {
           entry.thumb = client.thumb;
           updateThumbnail(client, entry);

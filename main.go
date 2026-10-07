@@ -27,6 +27,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/quic-go/webtransport-go"
 )
 
 const (
@@ -50,6 +52,7 @@ type config struct {
 	keyFile       string
 	fps           int
 	bitrate       int
+	quic          bool
 }
 
 type server struct {
@@ -58,11 +61,25 @@ type server struct {
 	hub      *presenceHub
 	seq      atomic.Uint64
 	stopCh   chan struct{}
+	wt       *webtransport.Server
 	wsMu     sync.Mutex
-	sockets  map[*webSocket]struct{}
-	active   map[string]*webSocket // latest authenticated socket per user
+	sockets  map[recorderConn]struct{}
+	active   map[string]recorderConn // latest authenticated connection per user
 	wsWG     sync.WaitGroup
 	stopping bool
+}
+
+// recorderConn is a recorder session's message transport: a WebSocket, or a
+// WebTransport stream when --quic is enabled.
+type recorderConn interface {
+	readMessage() (byte, []byte, error)
+	writeJSON(v any) error
+	writeClose(code uint16, reason string)
+	close()
+	setReadDeadline(t time.Time)
+	setOnFrame(f func())
+	// keepalive probes the peer until done is closed.
+	keepalive(done <-chan struct{})
 }
 
 type clientInfo struct {
@@ -70,6 +87,7 @@ type clientInfo struct {
 	Username  string     `json:"username"`
 	Filename  string     `json:"filename,omitempty"`
 	Codec     string     `json:"codec,omitempty"`
+	Transport string     `json:"transport"`
 	Thumb     uint64     `json:"thumb,omitempty"`
 	ThumbAt   *time.Time `json:"thumbAt,omitempty"`
 	Rate      float64    `json:"rate"` // bytes per second over rateWindow
@@ -275,6 +293,7 @@ func main() {
 	flag.StringVar(&cfg.keyFile, "key", "", "TLS private key file (for example, Certbot privkey.pem)")
 	flag.IntVar(&cfg.fps, "fps", 2, "capture frames per second")
 	flag.StringVar(&bitrate, "bitrate", "256K", "video bitrate in bits/sec (supports K and M suffixes)")
+	flag.BoolVar(&cfg.quic, "quic", false, "also serve HTTP/3 on the same UDP ports and record over WebTransport (requires --cert and --key)")
 	flag.Parse()
 
 	logFile, err := os.OpenFile(cfg.logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
@@ -292,6 +311,9 @@ func main() {
 	if (cfg.certFile == "") != (cfg.keyFile == "") {
 		log.Fatal("invalid TLS settings: --cert and --key must be provided together")
 	}
+	if cfg.quic && cfg.certFile == "" {
+		log.Fatal("invalid settings: --quic requires --cert and --key")
+	}
 	if cfg.dashboardPass == "" {
 		log.Fatal("invalid settings: -p dashboard password is required")
 	}
@@ -308,8 +330,8 @@ func main() {
 		users:   users,
 		hub:     newPresenceHub(users),
 		stopCh:  make(chan struct{}),
-		sockets: make(map[*webSocket]struct{}),
-		active:  make(map[string]*webSocket),
+		sockets: make(map[recorderConn]struct{}),
+		active:  make(map[string]recorderConn),
 	}
 	go func() {
 		t := time.NewTicker(time.Second)
@@ -323,18 +345,22 @@ func main() {
 			}
 		}
 	}()
-	recorderMux := http.NewServeMux()
-	recorderMux.HandleFunc("/", s.serveRecorder)
-	recorderMux.HandleFunc("/app.js", s.serveAppJS)
-	recorderMux.HandleFunc("/ws", s.serveWebSocket)
-	dashboardMux := http.NewServeMux()
-	dashboardMux.HandleFunc("/", s.serveDashboard)
-	dashboardMux.HandleFunc("/events", s.serveEvents)
-	dashboardMux.HandleFunc("/thumb", s.serveThumb)
+	recorderHandler := s.recorderHandler()
+	dashboardHandler := s.dashboardHandler()
 
-	recorderHTTP := &http.Server{Addr: cfg.listen, Handler: securityHeaders(recorderMux), ReadHeaderTimeout: 60 * time.Second}
-	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: securityHeaders(basicAuth(cfg.dashboardPass, dashboardMux)), ReadHeaderTimeout: 60 * time.Second}
-	errCh := make(chan error, 2)
+	var recorderQUIC, dashboardQUIC *quicEndpoint
+	if cfg.quic {
+		recorderQUIC, dashboardQUIC, err = s.listenQUIC()
+		if err != nil {
+			log.Fatalf("listen QUIC: %v", err)
+		}
+		recorderHandler = recorderQUIC.advertise(recorderHandler)
+		dashboardHandler = dashboardQUIC.advertise(dashboardHandler)
+	}
+
+	recorderHTTP := &http.Server{Addr: cfg.listen, Handler: recorderHandler, ReadHeaderTimeout: 60 * time.Second}
+	dashboardHTTP := &http.Server{Addr: cfg.dashboardAddr, Handler: dashboardHandler, ReadHeaderTimeout: 60 * time.Second}
+	errCh := make(chan error, 4)
 	serve := func(httpServer *http.Server) error {
 		if cfg.certFile != "" {
 			ln, err := net.Listen("tcp", httpServer.Addr)
@@ -357,6 +383,14 @@ func main() {
 		log.Printf("dashboard listening on %s://%s", scheme, cfg.dashboardAddr)
 		errCh <- serve(dashboardHTTP)
 	}()
+	for _, endpoint := range []*quicEndpoint{recorderQUIC, dashboardQUIC} {
+		if endpoint != nil {
+			go func() {
+				log.Printf("%s listening on HTTP/3 udp %s", endpoint.name, endpoint.conn.LocalAddr())
+				errCh <- endpoint.serve()
+			}()
+		}
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -366,21 +400,27 @@ func main() {
 		s.beginShutdown()
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		var shutdownWG sync.WaitGroup
-		for _, httpServer := range []*http.Server{recorderHTTP, dashboardHTTP} {
+		shutdowns := []func(context.Context) error{recorderHTTP.Shutdown, dashboardHTTP.Shutdown}
+		for _, endpoint := range []*quicEndpoint{recorderQUIC, dashboardQUIC} {
+			if endpoint != nil {
+				shutdowns = append(shutdowns, endpoint.shutdown)
+			}
+		}
+		for _, shutdown := range shutdowns {
 			shutdownWG.Add(1)
-			go func(httpServer *http.Server) {
+			go func() {
 				defer shutdownWG.Done()
-				_ = httpServer.Shutdown(ctx)
-			}(httpServer)
+				_ = shutdown(ctx)
+			}()
 		}
 		shutdownWG.Wait()
-		webSocketsDone := make(chan struct{})
+		connsDone := make(chan struct{})
 		go func() {
 			s.wsWG.Wait()
-			close(webSocketsDone)
+			close(connsDone)
 		}()
 		select {
-		case <-webSocketsDone:
+		case <-connsDone:
 		case <-ctx.Done():
 		}
 		cancel()
@@ -391,7 +431,26 @@ func main() {
 	}
 }
 
-func (s *server) trackWebSocket(ws *webSocket) bool {
+func (s *server) recorderHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.serveRecorder)
+	mux.HandleFunc("/app.js", s.serveAppJS)
+	mux.HandleFunc("/ws", s.serveWebSocket)
+	if s.cfg.quic {
+		mux.HandleFunc("/wt", s.serveWebTransport)
+	}
+	return securityHeaders(mux)
+}
+
+func (s *server) dashboardHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.serveDashboard)
+	mux.HandleFunc("/events", s.serveEvents)
+	mux.HandleFunc("/thumb", s.serveThumb)
+	return securityHeaders(basicAuth(s.cfg.dashboardPass, mux))
+}
+
+func (s *server) trackConn(ws recorderConn) bool {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	if s.stopping {
@@ -402,8 +461,8 @@ func (s *server) trackWebSocket(ws *webSocket) bool {
 	return true
 }
 
-// replaceActive makes ws the user's active socket and closes any older one.
-func (s *server) replaceActive(username string, ws *webSocket, remote string) {
+// replaceActive makes ws the user's active connection and closes any older one.
+func (s *server) replaceActive(username string, ws recorderConn, remote string) {
 	s.wsMu.Lock()
 	old := s.active[username]
 	s.active[username] = ws
@@ -415,7 +474,7 @@ func (s *server) replaceActive(username string, ws *webSocket, remote string) {
 	}
 }
 
-func (s *server) releaseActive(username string, ws *webSocket) {
+func (s *server) releaseActive(username string, ws recorderConn) {
 	s.wsMu.Lock()
 	if s.active[username] == ws {
 		delete(s.active, username)
@@ -423,7 +482,7 @@ func (s *server) releaseActive(username string, ws *webSocket) {
 	s.wsMu.Unlock()
 }
 
-func (s *server) untrackWebSocket(ws *webSocket) {
+func (s *server) untrackConn(ws recorderConn) {
 	s.wsMu.Lock()
 	if _, ok := s.sockets[ws]; ok {
 		delete(s.sockets, ws)
@@ -436,7 +495,7 @@ func (s *server) beginShutdown() {
 	s.wsMu.Lock()
 	s.stopping = true
 	close(s.stopCh)
-	sockets := make([]*webSocket, 0, len(s.sockets))
+	sockets := make([]recorderConn, 0, len(s.sockets))
 	for ws := range s.sockets {
 		sockets = append(sockets, ws)
 	}
@@ -542,6 +601,11 @@ func (s *server) serveAppJS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	js := strings.ReplaceAll(appJS, "__FPS__", strconv.Itoa(s.cfg.fps))
 	js = strings.ReplaceAll(js, "__BITRATE__", strconv.Itoa(s.cfg.bitrate))
+	transport := "websocket"
+	if s.cfg.quic {
+		transport = "webtransport"
+	}
+	js = strings.ReplaceAll(js, "__TRANSPORT__", strconv.Quote(transport))
 	_, _ = io.WriteString(w, js)
 }
 
@@ -561,14 +625,20 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !s.trackWebSocket(ws) {
+	s.serveSession(ws, "websocket", r.RemoteAddr)
+}
+
+// serveSession authenticates a recorder connection and writes its video
+// messages to a new recording file.
+func (s *server) serveSession(ws recorderConn, transport, remoteAddr string) {
+	if !s.trackConn(ws) {
 		ws.writeClose(1001, "server shutting down")
 		ws.close()
 		return
 	}
-	defer s.untrackWebSocket(ws)
+	defer s.untrackConn(ws)
 	defer ws.close()
-	_ = ws.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	ws.setReadDeadline(time.Now().Add(60 * time.Second))
 	op, data, err := ws.readMessage()
 	if err != nil || op != opText {
 		ws.writeClose(4000, "authentication required")
@@ -583,13 +653,13 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	id := s.seq.Add(1)
 	now := time.Now()
-	remote := remoteIP(r.RemoteAddr)
+	remote := remoteIP(remoteAddr)
 	s.replaceActive(cmd.Username, ws, remote)
 	defer s.releaseActive(cmd.Username, ws)
-	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Connected: now, LastSeen: now})
+	s.hub.set(clientInfo{ID: id, Username: cmd.Username, Transport: transport, Connected: now, LastSeen: now})
 	defer s.hub.remove(id)
 	recordingPath := ""
-	log.Printf("client connected: user=%q ip=%q", cmd.Username, remote)
+	log.Printf("client connected: user=%q ip=%q transport=%s", cmd.Username, remote, transport)
 	defer func() {
 		if recordingPath == "" {
 			log.Printf("client disconnected: user=%q ip=%q", cmd.Username, remote)
@@ -597,32 +667,18 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("client disconnected: user=%q ip=%q path=%q", cmd.Username, remote, recordingPath)
 	}()
-	ws.onFrame = func() {
-		_ = ws.conn.SetReadDeadline(time.Now().Add(clientTimeout))
+	ws.setOnFrame(func() {
+		ws.setReadDeadline(time.Now().Add(clientTimeout))
 		s.hub.touch(id)
-	}
+	})
 	if err := ws.writeJSON(map[string]any{"type": "auth-ok", "fps": s.cfg.fps, "bitrate": s.cfg.bitrate}); err != nil {
 		return
 	}
-	_ = ws.conn.SetReadDeadline(time.Now().Add(clientTimeout))
+	ws.setReadDeadline(time.Now().Add(clientTimeout))
 
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		t := time.NewTicker(pingInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				if ws.writeFrame(opPing, []byte(strconv.FormatInt(time.Now().Unix(), 10))) != nil {
-					_ = ws.conn.Close()
-					return
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	go ws.keepalive(done)
 
 	var file *os.File
 	var codec string
@@ -644,7 +700,7 @@ func (s *server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		op, data, err = ws.readMessage()
 		if err != nil {
 			if !isExpectedClose(err) {
-				log.Printf("websocket %s: %v", cmd.Username, err)
+				log.Printf("%s %s: %v", transport, cmd.Username, err)
 			}
 			return
 		}
@@ -794,7 +850,6 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
 	updates := s.hub.subscribe()
 	defer s.hub.unsubscribe(updates)
 	ticker := time.NewTicker(15 * time.Second)
@@ -975,7 +1030,25 @@ func (w *webSocket) writeClose(code uint16, reason string) {
 	b = append(b, reason...)
 	_ = w.writeFrame(opClose, b)
 }
-func (w *webSocket) close() { _ = w.conn.Close() }
+func (w *webSocket) close()                      { _ = w.conn.Close() }
+func (w *webSocket) setReadDeadline(t time.Time) { _ = w.conn.SetReadDeadline(t) }
+func (w *webSocket) setOnFrame(f func())         { w.onFrame = f }
+
+func (w *webSocket) keepalive(done <-chan struct{}) {
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if w.writeFrame(opPing, []byte(strconv.FormatInt(time.Now().Unix(), 10))) != nil {
+				w.close()
+				return
+			}
+		case <-done:
+			return
+		}
+	}
+}
 func (w *webSocket) writeFrame(op byte, payload []byte) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
@@ -997,7 +1070,7 @@ func (w *webSocket) writeFrame(op byte, payload []byte) error {
 }
 
 func isExpectedClose(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "connection reset")
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "connection reset") || isWebTransportClose(err)
 }
 
 // redirectListener hands TLS connections to the server and answers plain
