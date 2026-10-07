@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -61,7 +62,18 @@ func (s *server) listenQUIC() (recorder, dashboard *quicEndpoint, err error) {
 	}
 
 	recorderH3 := newHTTP3Server(tlsConf)
-	s.wt = &webtransport.Server{H3: recorderH3}
+	s.wt = &webtransport.Server{
+		H3: recorderH3,
+		// Safari needs the WT_INITIAL_MAX_* settings, which webtransport-go
+		// only sends when they are set; without them it can't open a stream
+		// (quic-go/webtransport-go#355). A session uses one bidirectional
+		// stream, and QUIC flow control already bounds the data in flight.
+		Config: &webtransport.Config{
+			MaxIncomingStreams:    16,
+			MaxIncomingUniStreams: -1,
+			MaxIncomingData:       math.MaxInt64,
+		},
+	}
 	recorder = &quicEndpoint{
 		name:  "recorder",
 		conn:  recorderConn,
